@@ -14,8 +14,7 @@ import org.http4s.{Challenge, Credentials}
 import org.http4s.implicits.*
 import org.typelevel.ci.CIString
 
-// 1. Modelos de dados para o payload JSON
-case class WebhookPayload(
+final case class WebhookPayload(
     event: Option[String],
     transaction_id: Option[String],
     amount: Option[String],
@@ -23,38 +22,61 @@ case class WebhookPayload(
     timestamp: Option[String]
 )
 
-case class CallbackPayload(transaction_id: String)
+final case class CallbackPayload(transaction_id: String)
 
-implicit val webhookPayloadDecoder: EntityDecoder[IO, WebhookPayload] = jsonOf[IO, WebhookPayload]
-implicit val callbackPayloadEncoder: EntityEncoder[IO, CallbackPayload] = jsonEncoderOf[IO, CallbackPayload]
+object WebhookPayload {
+  implicit val decoder: EntityDecoder[IO, WebhookPayload] = jsonOf[IO, WebhookPayload]
+}
+
+object CallbackPayload {
+  implicit val encoder: EntityEncoder[IO, CallbackPayload] = jsonEncoderOf[IO, CallbackPayload]
+}
+
+opaque type TransactionId = String
+object TransactionId {
+  def apply(value: String): TransactionId = value
+  extension (id: TransactionId) def value: String = id
+}
+
+opaque type WebhookToken = String
+object WebhookToken {
+  def apply(value: String): WebhookToken = value
+  extension (token: WebhookToken) def value: String = token
+}
+
+final case class WebhookConfig(
+    validToken: WebhookToken,
+    serverHost: String = "localhost",
+    serverPort: Int = 5000,
+    callbackHost: String = "127.0.0.1",
+    callbackPort: Int = 5001
+)
 
 object WebhookApp extends IOApp.Simple {
+  
+  private val config = WebhookConfig(WebhookToken("meu-token-secreto"))
 
-  val validToken = "meu-token-secreto"
-
-  // Função que define as rotas do nosso webhook
-  def webhookRoutes(processedTx: Ref[IO, Set[String]], client: Client[IO]): HttpRoutes[IO] = {
+  def webhookRoutes(processedTx: Ref[IO, Set[TransactionId]], client: Client[IO]): HttpRoutes[IO] = {
     HttpRoutes.of[IO] {
-      // 2. Mapeia requisições POST para /webhook
       case req @ POST -> Root / "webhook" =>
-        val tokenOpt = req.headers.get(CIString("X-Webhook-Token")).map(_.head.value)
+        val tokenOpt = req.headers.get(CIString("X-Webhook-Token")).map(h => WebhookToken(h.head.value))
 
-        // 3. Orquestra a lógica usando for-comprehension em IO
         val action: IO[Response[IO]] = for {
           payload <- req.as[WebhookPayload]
           response <- validateAndNotify(payload, tokenOpt, processedTx, client)
         } yield response
 
-        // Lida com erros (ex: JSON inválido) e executa a ação
-        action.handleErrorWith {
-          case _: InvalidMessageBodyFailure =>
-            IO.println("❌ Payload com JSON inválido. Rejeitando com 400 Bad Request.") *>
-              BadRequest("Invalid or malformed JSON")
-          case e =>
-            IO.println(s"💥 Erro inesperado: ${e.getMessage}") *>
-              InternalServerError("An unexpected error occurred")
-        }
+        action.handleErrorWith(handleWebhookErrors)
     }
+  }
+
+  private def handleWebhookErrors: Throwable => IO[Response[IO]] = {
+    case _: InvalidMessageBodyFailure =>
+      IO.println("❌ Payload com JSON inválido. Rejeitando com 400 Bad Request.") *>
+        BadRequest("Invalid or malformed JSON")
+    case e =>
+      IO.println(s"💥 Erro inesperado: ${e.getMessage}") *>
+        InternalServerError("An unexpected error occurred")
   }
 
   /**
@@ -62,96 +84,123 @@ object WebhookApp extends IOApp.Simple {
     */
   def validateAndNotify(
       payload: WebhookPayload,
-      token: Option[String],
-      processedTx: Ref[IO, Set[String]],
+      token: Option[WebhookToken],
+      processedTx: Ref[IO, Set[TransactionId]],
       client: Client[IO]
   ): IO[Response[IO]] = {
-    // Test 4: Token inválido ou ausente
-    if (!token.contains(validToken)) {
+    if (!isValidToken(token)) {
       IO.println("❌ Token inválido ou ausente. Rejeitando com 401 Unauthorized.") *>
         Unauthorized(`WWW-Authenticate`(NonEmptyList.one(Challenge("Bearer", "webhook"))))
     } else {
-      (payload.transaction_id, payload.amount, payload.timestamp) match {
-        // Test 6 & 5: Campos obrigatórios ausentes
-        case (None, _, _) | (_, _, None) =>
-          for {
-            _ <- IO.println(s"❌ Payload com campos obrigatórios ausentes. ID: ${payload.transaction_id.getOrElse("N/A")}. Rejeitando com 400 Bad Request.")
-            // Notifica o cancelamento se o ID da transação estiver presente
-            _ <- payload.transaction_id.traverse_(id => notifyCallback("cancelar", id, client))
-            response <- BadRequest("Missing required fields")
-          } yield response
+      validatePayloadAndProcess(payload, processedTx, client)
+    }
+  }
 
-        case (Some(id), _, _) =>
-          processedTx.get.flatMap { knownIds =>
-            // Test 2: Transação duplicada
-            if (knownIds.contains(id)) {
-              IO.println(s"❌ ID de transação duplicado: $id. Rejeitando com 409 Conflict.") *>
-                Conflict("Duplicate transaction")
-            }
-            // Test 3: Valor (amount) incorreto
-            else if (!isValidAmount(payload.amount)) {
-              for {
-                _ <- IO.println(s"❌ Valor inválido para transação ID: $id. Notificando /cancelar.")
-                _ <- notifyCallback("cancelar", id, client)
-                response <- BadRequest("Invalid amount")
-              } yield response
-            }
-            // Test 1: Fluxo de sucesso
-            else {
-              for {
-                _ <- IO.println(s"✅ Transação bem-sucedida: $id. Notificando /confirmar.")
-                _ <- processedTx.update(_ + id) // Adiciona ID ao conjunto de processados
-                _ <- notifyCallback("confirmar", id, client)
-                response <- Ok("Webhook processed")
-              } yield response
-            }
-          }
+  private def isValidToken(token: Option[WebhookToken]): Boolean =
+    token.contains(config.validToken)
+
+  private def validatePayloadAndProcess(
+      payload: WebhookPayload,
+      processedTx: Ref[IO, Set[TransactionId]],
+      client: Client[IO]
+  ): IO[Response[IO]] = {
+    (payload.transaction_id, payload.amount, payload.timestamp) match {
+      case (None, _, _) | (_, _, None) =>
+        handleMissingFields(payload, client)
+      case (Some(idStr), _, _) =>
+        val id = TransactionId(idStr)
+        processTransaction(id, payload, processedTx, client)
+    }
+  }
+
+  private def handleMissingFields(payload: WebhookPayload, client: Client[IO]): IO[Response[IO]] =
+    for {
+      _ <- IO.println(s"❌ Payload com campos obrigatórios ausentes. ID: ${payload.transaction_id.getOrElse("N/A")}.")
+      _ <- payload.transaction_id.traverse_(id => notifyCallback("cancelar", TransactionId(id), client))
+      response <- BadRequest("Missing required fields")
+    } yield response
+
+  private def processTransaction(
+      id: TransactionId,
+      payload: WebhookPayload,
+      processedTx: Ref[IO, Set[TransactionId]],
+      client: Client[IO]
+  ): IO[Response[IO]] = {
+    processedTx.get.flatMap { knownIds =>
+      if (knownIds.contains(id)) {
+        IO.println(s"❌ ID de transação duplicada: ${id.value}. Rejeitando com 409 Conflict.") *>
+          Conflict("Duplicate transaction")
+      }
+      else if (!isValidAmount(payload.amount)) {
+        handleInvalidAmount(id, client)
+      }
+      else {
+        handleSuccessfulTransaction(id, processedTx, client)
       }
     }
   }
 
-  /**
-    * Verifica se o valor é um número positivo.
-    */
-  def isValidAmount(amountOpt: Option[String]): Boolean =
-    amountOpt.flatMap(_.toDoubleOption).exists(_ > 0.0)
+  private def handleInvalidAmount(id: TransactionId, client: Client[IO]): IO[Response[IO]] =
+    for {
+      _ <- IO.println(s"❌ Valor inválido para transação ID: ${id.value}. Notificando /cancelar.")
+      _ <- notifyCallback("cancelar", id, client)
+      response <- BadRequest("Invalid amount")
+    } yield response
+
+  private def handleSuccessfulTransaction(
+      id: TransactionId,
+      processedTx: Ref[IO, Set[TransactionId]],
+      client: Client[IO]
+  ): IO[Response[IO]] =
+    for {
+      _ <- IO.println(s"✅ Transação bem-sucedida: ${id.value}. Notificando /confirmar.")
+      _ <- processedTx.update(_ + id)
+      _ <- notifyCallback("confirmar", id, client)
+      response <- Ok("Webhook processed")
+    } yield response
+
+  private def isValidAmount(amountOpt: Option[String]): Boolean =
+    amountOpt
+      .flatMap(_.toDoubleOption)
+      .exists(amount => amount > 0.0 && amount.isFinite)
 
   /**
     * Realiza uma chamada POST assíncrona para os endpoints de callback do Python.
     */
-  def notifyCallback(endpoint: String, transactionId: String, client: Client[IO]): IO[Unit] = {
+  def notifyCallback(endpoint: String, transactionId: TransactionId, client: Client[IO]): IO[Unit] = {
     val targetUri = uri"http://127.0.0.1:5001".withPath(Path.fromString(s"/$endpoint"))
-    val payload = CallbackPayload(transactionId)
+    val payload = CallbackPayload(transactionId.value)
 
-    // Create the request properly using Method and Uri
     val request = Request[IO](
       method = Method.POST,
       uri = targetUri
-    ).withEntity(payload) // Fixed POST usage
+    ).withEntity(payload) 
     
     client.successful(request).flatMap { success =>
-      if (success) IO.println(s"📞 Callback para /$endpoint (ID: $transactionId) enviado com sucesso.")
-      else IO.println(s"🔥 Falha ao enviar callback para /$endpoint (ID: $transactionId).")
+      if (success) {
+        IO.println(s"📞 Callback para /$endpoint (ID: ${transactionId.value}) enviado com sucesso.")
+      } else {
+        IO.println(s"🔥 Falha ao enviar callback para /$endpoint (ID: ${transactionId.value}).")
+      }
+    }.handleErrorWith { error =>
+      IO.println(s"💥 Erro ao enviar callback: ${error.getMessage}")
     }
   }
 
-  // 4. Ponto de entrada da aplicação
   def run: IO[Unit] = {
-    for {
-      // Cria o estado atômico para armazenar os IDs das transações
-      processedTxRef <- Ref.of[IO, Set[String]](Set.empty)
-      // Constrói o cliente e o servidor como Recursos gerenciados pelo Cats Effect
-      _ <- EmberClientBuilder.default[IO].build.use { client =>
-        EmberServerBuilder.default[IO]
-          .withHost(host"localhost")
-          .withPort(port"5000")
-          .withHttpApp(webhookRoutes(processedTxRef, client).orNotFound)
-          .build
-          .use(_ => // Fixed: added .use here
-            IO.println("🚀 Servidor online em http://localhost:5000/\nPressione CTRL+C para parar...") *>
-            IO.never // Mantém o servidor rodando indefinidamente
-          )
-      }
-    } yield ()
+    val resources = for {
+      processedTxRef <- Resource.eval(Ref.of[IO, Set[TransactionId]](Set.empty))
+      client <- EmberClientBuilder.default[IO].build
+      server <- EmberServerBuilder.default[IO]
+        .withHost(host"localhost")
+        .withPort(port"5000")
+        .withHttpApp(webhookRoutes(processedTxRef, client).orNotFound)
+        .build
+    } yield server
+
+    resources.use(_ =>
+      IO.println("🚀 Servidor online em http://localhost:5000/\nPressione CTRL+C para parar...") *>
+        IO.never
+    )
   }
 }
